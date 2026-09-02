@@ -12,9 +12,18 @@ extern NimBLEClient *debugBLEClient;
 // TUNABLES
 // ---------------------------------------------------------------------------
 
+// Beacon names. Index here == anchor_id - 1.
+static const char *TARGET_NAMES[RANGING_N_TARGETS] = {
+    "orbt_ble1", "orbt_ble2", "orbt_ble3"
+};
+
+// BRING-UP ONLY: run ranging without a controller connected.
+// Set to false once the gamepad is in the loop.
+static const bool FORCE_RANGING = true;
+
 // Ranging scan duty cycle. NimBLE 2.x takes MILLISECONDS (1.x used 0.625ms).
 // The controller only needs ~10% of the radio (2ms every 20ms), so 80/100 is
-// reasonable. If BLE_ConnInterval starts drifting above 16, back the window off.
+// reasonable. If BLE_ConnInterval drifts above 16, back the window off.
 static const uint16_t RANGE_INTERVAL_MS = 100;
 static const uint16_t RANGE_WINDOW_MS   = 80;
 
@@ -26,6 +35,8 @@ static const uint16_t DISC_WINDOW_MS   = 15;
 static const uint32_t WINDOW_MS = 200;    // reporting window -> 5 Hz
 
 // RSSI -> distance log fit: rssi = A*ln(d_cm) + B   (NimBLE-calibrated values)
+// Shared across beacons. Per-anchor FIT_A/FIT_B is more accurate if hardware
+// varies, but shared values work functionally.
 static const float FIT_A       = -15.75f;
 static const float FIT_B       = 3.1501f;
 static const float MIN_DIST_CM = 2.0f;
@@ -39,56 +50,75 @@ static const bool  WEIGHT_R_BY_N = true;  // R = KF_R / n : distrust sparse wind
 static const bool     SERIAL_PRINT = true;
 static const uint32_t PRINT_MS     = 200;
 
-static const bool FORCE_RANGING = true;
-
 // ---------------------------------------------------------------------------
 // STATE
 // ---------------------------------------------------------------------------
 
-static char g_targetName[32] = {0};
-static bool g_begun    = false;
-static bool g_ranging  = false;   // true once controller is connected
+struct BeaconState {
+    // accumulator (written from the NimBLE task)
+    int32_t  rssiSum;
+    uint16_t rssiN;
 
-// Written from the NimBLE task, read from loop() -> guard with a spinlock.
+    // latched address: after the first name match, compare addresses instead
+    // of strings -- cheaper in the callback, and immune to the name being
+    // absent from later adverts.
+    NimBLEAddress addr;
+    bool          haveAddr;
+
+    // Kalman + output
+    float    kfX, kfP;
+    bool     kfInit;
+    float    rssiFilt;
+    float    distM;
+    uint16_t lastN;
+};
+
+static BeaconState g_b[RANGING_N_TARGETS];
+
+static bool g_begun   = false;
+static bool g_ranging = false;
+
+// The accumulator is touched from the NimBLE task and from loop().
 static portMUX_TYPE g_mux = portMUX_INITIALIZER_UNLOCKED;
-static int32_t  g_rssiSum = 0;
-static uint16_t g_rssiN   = 0;
 
-// Latched target address: after the first name match, compare addresses
-// (cheaper, and immune to the name being absent from later adverts).
-static bool          g_haveAddr = false;
-static NimBLEAddress g_targetAddr;
-
-static float    g_rssiFilt = 0.0f;
-static float    g_distM    = -1.0f;
-static uint16_t g_lastN    = 0;
-
-static float g_kfX = 0.0f, g_kfP = 1.0f;
-static bool  g_kfInit = false;
-
+static bool     g_allValid    = false;
 static uint32_t g_windowStart = 0;
 static uint32_t g_lastPrint   = 0;
 static uint32_t g_rateStart   = 0;
 static uint32_t g_rateCount   = 0;
 static float    g_pktRate     = 0.0f;
 
+static void resetBeacons() {
+    for (int i = 0; i < RANGING_N_TARGETS; i++) {
+        g_b[i].rssiSum  = 0;
+        g_b[i].rssiN    = 0;
+        g_b[i].haveAddr = false;
+        g_b[i].kfX      = 0.0f;
+        g_b[i].kfP      = 1.0f;
+        g_b[i].kfInit   = false;
+        g_b[i].rssiFilt = 0.0f;
+        g_b[i].distM    = -1.0f;
+        g_b[i].lastN    = 0;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // FILTER
 // ---------------------------------------------------------------------------
 
-static float kalmanStep(float z, float R) {
-    if (!g_kfInit) {                 // seed to first measurement, not 0
-        g_kfX    = z;
-        g_kfP    = R;
-        g_kfInit = true;
-        return g_kfX;
+static float kalmanStep(BeaconState &b, float z, float R) {
+    if (!b.kfInit) {                 // seed to first measurement, not 0
+        b.kfX    = z;
+        b.kfP    = R;
+        b.kfInit = true;
+        return b.kfX;
     }
-    g_kfP += KF_Q;                   // predict (no rate term)
-    const float S = g_kfP + R;
-    const float K = g_kfP / S;
-    g_kfX += K * (z - g_kfX);        // update
-    g_kfP  = (1.0f - K) * g_kfP;
-    return g_kfX;
+    b.kfP += KF_Q;                   // predict (no rate term)
+    const float S = b.kfP + R;
+    const float K = b.kfP / S;
+    b.kfX += K * (z - b.kfX);        // update
+    b.kfP  = (1.0f - K) * b.kfP;
+    return b.kfX;
 }
 
 static float rssiToDistM(float rssi) {
@@ -122,12 +152,11 @@ static void applyRangingParams() {
     // stores a raw `const NimBLEAdvertisedDevice* advDevice` and dereferences
     // it in connectToServer(); that pointer is only kept alive by the results
     // vector. Disabling results would dangle it and corrupt the heap on
-    // connect. Instead the vector is cleared each window in initiatorUpdate(),
-    // which is safe because that only runs while already connected.
+    // connect. Instead the vector is cleared each window in initiatorUpdate().
 
     s->start(0, false, true);       // duration 0 = forever
-    Serial.printf("[initiator] ranging scan %u/%u ms passive\n",
-                  RANGE_INTERVAL_MS, RANGE_WINDOW_MS);
+    Serial.printf("[initiator] ranging scan %u/%u ms passive, %d targets\n",
+                  RANGE_INTERVAL_MS, RANGE_WINDOW_MS, RANGING_N_TARGETS);
 }
 
 static void applyDiscoveryParams() {
@@ -150,20 +179,23 @@ static void applyDiscoveryParams() {
 // API
 // ---------------------------------------------------------------------------
 
-bool initiatorBegin(const char *targetName) {
+bool initiatorBegin() {
     if (!NimBLEDevice::isInitialized()) {
         Serial.println("[initiator] NimBLE not initialised - call AFTER bleJoystick.begin()");
         return false;                       // NEVER init here
     }
 
-    strncpy(g_targetName, targetName, sizeof(g_targetName) - 1);
+    resetBeacons();
 
     g_windowStart = millis();
     g_rateStart   = g_windowStart;
     g_begun       = true;
 
-    Serial.printf("[initiator] armed, target=\"%s\" (ranging starts when controller connects)\n",
-                  g_targetName);
+    Serial.print("[initiator] armed, targets:");
+    for (int i = 0; i < RANGING_N_TARGETS; i++) {
+        Serial.printf(" %s", TARGET_NAMES[i]);
+    }
+    Serial.println();
     return true;
 }
 
@@ -172,19 +204,32 @@ bool initiatorBegin(const char *targetName) {
 bool initiatorOnAdvert(const NimBLEAdvertisedDevice *dev) {
     if (!g_begun || !g_ranging || dev == nullptr) return false;
 
-    if (g_haveAddr) {
-        if (dev->getAddress() != g_targetAddr) return false;
-    } else {
+    int idx = -1;
+
+    // Fast path: address already latched for this beacon.
+    for (int i = 0; i < RANGING_N_TARGETS; i++) {
+        if (g_b[i].haveAddr && dev->getAddress() == g_b[i].addr) { idx = i; break; }
+    }
+
+    // Slow path: match by advertised name, then latch the address.
+    if (idx < 0) {
         if (!dev->haveName()) return false;
-        if (strcmp(dev->getName().c_str(), g_targetName) != 0) return false;
-        g_targetAddr = dev->getAddress();
-        g_haveAddr   = true;
+        const char *nm = dev->getName().c_str();
+        for (int i = 0; i < RANGING_N_TARGETS; i++) {
+            if (!g_b[i].haveAddr && strcmp(nm, TARGET_NAMES[i]) == 0) {
+                g_b[i].addr     = dev->getAddress();
+                g_b[i].haveAddr = true;
+                idx = i;
+                break;
+            }
+        }
+        if (idx < 0) return false;
     }
 
     const int rssi = dev->getRSSI();
     portENTER_CRITICAL(&g_mux);
-    g_rssiSum = g_rssiSum + rssi;
-    g_rssiN   = g_rssiN + 1;
+    g_b[idx].rssiSum = g_b[idx].rssiSum + rssi;
+    g_b[idx].rssiN   = g_b[idx].rssiN + 1;
     portEXIT_CRITICAL(&g_mux);
     return true;
 }
@@ -195,7 +240,8 @@ void initiatorUpdate() {
     const uint32_t now = millis();
 
     // --- controller connection state edge detection ---
-    const bool connected = FORCE_RANGING || (debugBLEClient != nullptr && debugBLEClient->isConnected());
+    const bool connected = FORCE_RANGING ||
+                           (debugBLEClient != nullptr && debugBLEClient->isConnected());
     if (connected != g_ranging) {
         g_ranging = connected;
         if (connected) {
@@ -205,16 +251,15 @@ void initiatorUpdate() {
             g_rateCount   = 0;
         } else {
             applyDiscoveryParams();
-            g_haveAddr = false;         // re-latch target on next session
-            g_kfInit   = false;         // re-seed the filter
-            g_lastN    = 0;
+            resetBeacons();             // re-latch and re-seed on next session
             g_pktRate  = 0.0f;
+            g_allValid = false;
         }
     }
 
     if (!g_ranging) return;             // joystick owns the scan while disconnected
 
-    // Watchdog: only restart while connected, so we never stomp on the
+    // Watchdog: only restart while ranging, so we never stomp on the
     // joystick's stop()-then-connect sequence.
     NimBLEScan *s = NimBLEDevice::getScan();
     if (s && !s->isScanning()) {
@@ -224,26 +269,36 @@ void initiatorUpdate() {
     if (now - g_windowStart < WINDOW_MS) return;
     g_windowStart = now;
 
-    // Safe here: we are connected, so advDevice is not in use by the joystick.
+    // Safe here: ranging only runs once the controller is up, so the
+    // joystick is not holding advDevice into the results vector.
     if (s) s->clearResults();
 
+    // Snapshot and clear all accumulators in one critical section.
+    int32_t  sum[RANGING_N_TARGETS];
+    uint16_t n[RANGING_N_TARGETS];
     portENTER_CRITICAL(&g_mux);
-    const int32_t  sum = g_rssiSum;
-    const uint16_t n   = g_rssiN;
-    g_rssiSum = 0;
-    g_rssiN   = 0;
+    for (int i = 0; i < RANGING_N_TARGETS; i++) {
+        sum[i] = g_b[i].rssiSum;
+        n[i]   = g_b[i].rssiN;
+        g_b[i].rssiSum = 0;
+        g_b[i].rssiN   = 0;
+    }
     portEXIT_CRITICAL(&g_mux);
 
-    g_lastN     = n;
-    g_rateCount = g_rateCount + n;
+    g_allValid = true;
+    for (int i = 0; i < RANGING_N_TARGETS; i++) {
+        g_b[i].lastN = n[i];
+        g_rateCount  = g_rateCount + n[i];
 
-    if (n > 0) {
-        const float avg = (float)sum / (float)n;
-        const float R   = WEIGHT_R_BY_N ? (KF_R / (float)n) : KF_R;
-        g_rssiFilt = kalmanStep(avg, R);     // filter BEFORE the log conversion
-        g_distM    = rssiToDistM(g_rssiFilt);
+        if (n[i] > 0) {
+            const float avg = (float)sum[i] / (float)n[i];
+            const float R   = WEIGHT_R_BY_N ? (KF_R / (float)n[i]) : KF_R;
+            g_b[i].rssiFilt = kalmanStep(g_b[i], avg, R);  // filter BEFORE log conversion
+            g_b[i].distM    = rssiToDistM(g_b[i].rssiFilt);
+        } else {
+            g_allValid = false;     // hold last distance, do not blank it
+        }
     }
-    // n == 0: hold the last value, do not blank it.
 
     if (now - g_rateStart >= 1000) {
         g_pktRate   = (float)g_rateCount * 1000.0f / (float)(now - g_rateStart);
@@ -253,14 +308,25 @@ void initiatorUpdate() {
 
     if (SERIAL_PRINT && (now - g_lastPrint >= PRINT_MS)) {
         g_lastPrint = now;
-        Serial.printf("n=%-2u  rssi=%6.1f dBm  dist=%5.2f m  pps=%4.1f\n",
-                      g_lastN, g_rssiFilt, g_distM, g_pktRate);
+        // One line: per-beacon n and distance, then total packet rate.
+        for (int i = 0; i < RANGING_N_TARGETS; i++) {
+            Serial.printf("b%d n=%-2u ", i + 1, g_b[i].lastN);
+            if (g_b[i].distM >= 0.0f) Serial.printf("d=%4.2fm  ", g_b[i].distM);
+            else                      Serial.print("d= --    ");
+        }
+        Serial.printf("| pps=%4.1f\n", g_pktRate);
     }
 }
 
-float    initiatorDistanceM()   { return g_distM; }
-float    initiatorRssi()        { return g_rssiFilt; }
-uint16_t initiatorPacketCount() { return g_lastN; }
-bool     initiatorHasFix()      { return g_lastN > 0; }
-float    initiatorPacketRate()  { return g_pktRate; }
-bool     initiatorRanging()     { return g_ranging; }
+float initiatorDistanceM(uint8_t idx) {
+    return (idx < RANGING_N_TARGETS) ? g_b[idx].distM : -1.0f;
+}
+float initiatorRssi(uint8_t idx) {
+    return (idx < RANGING_N_TARGETS) ? g_b[idx].rssiFilt : 0.0f;
+}
+uint16_t initiatorPacketCount(uint8_t idx) {
+    return (idx < RANGING_N_TARGETS) ? g_b[idx].lastN : 0;
+}
+bool  initiatorAllValid()   { return g_allValid; }
+float initiatorPacketRate() { return g_pktRate; }
+bool  initiatorRanging()    { return g_ranging; }

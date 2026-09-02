@@ -57,7 +57,6 @@
 // Ranging target: the XIAO responder advertising this name.
 // Must match DEV_NAME in the responder sketch, and the name must be in the
 // ADVERTISING payload (not the scan response) -- the ranging scan is passive.
-#define RANGING_TARGET_NAME                 "orbt_ble1"
 
 // Serial-only bring-up: WiFi is not connected, so telemetry is disabled and
 // the coexistence metrics are printed to serial instead. Set to 0 once WiFi
@@ -336,9 +335,12 @@ void sendTelemetry() {
     }
 
     // Ranging metrics
-    telemetry->output_metric("Range_Dist", initiatorDistanceM(), "m");
-    telemetry->output_metric("Range_RSSI", initiatorRssi(), "dBm");
-    telemetry->output_metric("Range_N", initiatorPacketCount());
+    telemetry->output_metric("Range_D1", initiatorDistanceM(0), "m");
+    telemetry->output_metric("Range_D2", initiatorDistanceM(1), "m");
+    telemetry->output_metric("Range_D3", initiatorDistanceM(2), "m");
+    telemetry->output_metric("Range_N1", initiatorPacketCount(0));
+    telemetry->output_metric("Range_N2", initiatorPacketCount(1));
+    telemetry->output_metric("Range_N3", initiatorPacketCount(2));
     telemetry->output_metric("Range_PPS", initiatorPacketRate(), "pkt/s");
 #endif
 
@@ -416,7 +418,7 @@ void setup() {
     // Ranging initiator -- MUST be after bleJoystick.begin() (needs NimBLE up).
     // Arms only; the scan stays in discovery mode until the controller
     // connects, then switches itself to ranging parameters.
-    initiatorBegin(RANGING_TARGET_NAME);
+    initiatorBegin();
 #endif
 
     lastTelemetryMs = millis();
