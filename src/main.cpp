@@ -5,6 +5,7 @@
 // A trimmed-down version of orbt-core-firmware, keeping only:
 //   - WiFi (station mode)
 //   - BLE (joystick controller client, via NimBLE)
+//   - BLE ranging initiator (continuous scan alongside the controller)
 //   - UDP Telemetry (CBOR or Teleplot, switchable via TELEMETRY_MODE)
 //   - IMU + Sensor Fusion (IMS module: ICM42688 + Madgwick/VQF)
 //   - Status LED (battery level + charging indicator)
@@ -14,6 +15,13 @@
 // experiments that only need sensing + comms.
 //
 // Board: ESP32-C6, ORBT PCB Mk5.0 only.
+//
+// BLE RADIO OWNERSHIP (read before touching setup() ordering):
+//   - BLE_Client_Joystick::begin() is the ONLY place NimBLEDevice::init()
+//     is called. Never init NimBLE anywhere else.
+//   - initiatorBegin() must run AFTER bleJoystick.begin().
+//   - If ESP-NOW is reintroduced later, init it LAST, after all BLE setup --
+//     NimBLE init resets radio/channel state that ESP-NOW depends on.
 //
 //////////////////////////////////////////////////////////////////
 
@@ -30,8 +38,7 @@
 #include "utils/simple-udp.h"
 #include "utils/logging.h"
 #include "utils/imu_helper.h"
-#include "utils/ranging_beacon.h"
-#include "utils/ranging_receiver.h"
+#include "utils/initiator.h"
 
 #include "Telemetry.h"
 #include "TeleplotTelemetry.h"
@@ -46,6 +53,16 @@
 #include "SingleShotADCManager.h"
 
 #define TELEMETRY_EVERY_USECS               20000   // Log ALL Telemetry every usecs.  Can run up to 10000, depending on volume of UDP calls
+
+// Ranging target: the XIAO responder advertising this name.
+// Must match DEV_NAME in the responder sketch, and the name must be in the
+// ADVERTISING payload (not the scan response) -- the ranging scan is passive.
+#define RANGING_TARGET_NAME                 "orbt_ble1"
+
+// Serial-only bring-up: WiFi is not connected, so telemetry is disabled and
+// the coexistence metrics are printed to serial instead. Set to 0 once WiFi
+// telemetry is working again.
+#define SERIAL_DIAGNOSTICS                  0
 
 #if BLE_ENABLE
 #include "BLE_Client_Joystick.h"
@@ -64,11 +81,13 @@ constexpr uint32_t kWifiRetryDelayMs = 500;
 constexpr uint8_t kWifiMaxRetries = 20;
 constexpr uint32_t kTelemetryIntervalMs = 20;   // ~50Hz telemetry rate
 constexpr uint32_t kPowerMgmtIntervalMs = 100;  // 10Hz battery/charge sampling
+constexpr uint32_t kDiagIntervalMs = 1000;      // 1Hz serial coexistence report
 
 Telemetry* telemetry = nullptr;
 bool wifiConnected = false;
 uint64_t lastTelemetryMs = 0;
 uint64_t lastPowerMgmtMs = 0;
+uint64_t lastDiagMs = 0;
 
 // IMS / IMU (background task samples the IMU + runs sensor fusion)
 IMS ims;
@@ -237,6 +256,33 @@ void updateStatusLed() {
     }
 }
 
+#if SERIAL_DIAGNOSTICS
+// Serial-only coexistence report. This is the whole experiment: watch pps
+// (ranging packets/sec) against connInt (controller connection interval).
+//
+//   connInt should sit at 16 (16 * 1.25ms = 20ms), matching
+//   setConnectionParams(16, 16, 0, 51) in BLE_Client_Joystick.cpp.
+//   If it drifts upward, or the joystick feels laggy, the scan is starving
+//   the controller -- reduce RANGE_WINDOW_MS in initiator.cpp.
+void printDiagnostics() {
+#if BLE_ENABLE
+    if (debugBLEClient && debugBLEClient->isConnected()) {
+        NimBLEConnInfo ci = debugBLEClient->getConnInfo();
+        Serial.printf("[diag] connInt=%u ctrlRssi=%d | ranging=%d pps=%.1f n=%u rssi=%.1f dist=%.3f\n",
+                      ci.getConnInterval(),
+                      debugBLEClient->getRssi(),
+                      initiatorRanging() ? 1 : 0,
+                      initiatorPacketRate(),
+                      initiatorPacketCount(),
+                      initiatorRssi(),
+                      initiatorDistanceM());
+    } else {
+        Serial.println("[diag] controller disconnected - discovery scan, ranging idle");
+    }
+#endif
+}
+#endif  // SERIAL_DIAGNOSTICS
+
 void sendTelemetry() {
     if (!telemetry) {
         return;
@@ -288,6 +334,12 @@ void sendTelemetry() {
         telemetry->output_metric("BLE_ConnTimeout", connInfo.getConnTimeout(), "10ms");
         telemetry->output_metric("BLE_ConnLatency", connInfo.getConnLatency(), "intervals");
     }
+
+    // Ranging metrics
+    telemetry->output_metric("Range_Dist", initiatorDistanceM(), "m");
+    telemetry->output_metric("Range_RSSI", initiatorRssi(), "dBm");
+    telemetry->output_metric("Range_N", initiatorPacketCount());
+    telemetry->output_metric("Range_PPS", initiatorPacketRate(), "pkt/s");
 #endif
 
     if (powerManagement) {
@@ -313,6 +365,12 @@ void setup() {
 #endif
 
     // WiFi + UDP telemetry
+    //
+    // Serial-only bring-up: WiFi stays down entirely. A failed connect
+    // (connectWifi() -> fail -> WiFi.disconnect()) disturbs the radio, which
+    // is exactly what we don't want while measuring BLE coexistence. Leave
+    // both the connect and the disconnect out until telemetry is revisited.
+    //
     // wifiConnected = connectWifi();
     if (wifiConnected) {
         simple_udp_init();
@@ -326,11 +384,7 @@ void setup() {
 #endif
 
         LOG_INFO("WiFi + Telemetry ready. IP: %s", WiFi.localIP().toString().c_str());
-    } else {
-        WiFi.disconnect(true, false);
     }
-
-    
 
     // IMU + Sensor Fusion
     if (!ims.begin()) {
@@ -348,7 +402,8 @@ void setup() {
     powerManagement->begin();
     adcManager->start();
 
-    // BLE Joystick controller (NimBLE central, connects to a paired gamepad)
+    // BLE Joystick controller (NimBLE central, connects to a paired gamepad).
+    // This is the ONLY NimBLEDevice::init() in the firmware.
 #if BLE_ENABLE
     bleJoystick.set_connect_callback(onJoystickConnect);
     bleJoystick.set_movement_callback(onJoystickMovement);
@@ -358,28 +413,25 @@ void setup() {
     bleJoystick.set_button_callback(3, onJoystickButtonD);
     bleJoystick.begin();
 
-    rangingBeaconBegin("orbt_ble1");
+    // Ranging initiator -- MUST be after bleJoystick.begin() (needs NimBLE up).
+    // Arms only; the scan stays in discovery mode until the controller
+    // connects, then switches itself to ranging parameters.
+    initiatorBegin(RANGING_TARGET_NAME);
 #endif
 
-    rangingReceiverBegin();
     lastTelemetryMs = millis();
     lastPowerMgmtMs = lastTelemetryMs;
+    lastDiagMs = lastTelemetryMs;
     Serial.println("Setup complete.");
 }
 
 void loop() {
-    static uint32_t lastCh = 0;
-if (millis() - lastCh > 1000) {
-  lastCh = millis();
-  uint8_t pri; wifi_second_chan_t sec;
-  esp_wifi_get_channel(&pri, &sec);
-  Serial.print("robot ch="); Serial.println(pri);
-}
     // Pull the latest IMU + sensor-fusion result out of the background tasks
     ims.update();
 
 #if BLE_ENABLE
     bleJoystick.loop();
+    initiatorUpdate();
 #if PAIRING_VISUALISATION_ENABLE
     checkBlePairingTrigger();
 #endif
@@ -387,7 +439,6 @@ if (millis() - lastCh > 1000) {
 
     const uint64_t nowUs = esp_timer_get_time();
     orbtLed.handle(nowUs);
-
 
     const uint64_t now = millis();
 
@@ -406,6 +457,13 @@ if (millis() - lastCh > 1000) {
         lastTelemetryMs = now;
         sendTelemetry();
     }
-    rangingReceiverUpdate();
+
+#if SERIAL_DIAGNOSTICS
+    if (now - lastDiagMs >= kDiagIntervalMs) {
+        lastDiagMs = now;
+        printDiagnostics();
+    }
+#endif
+
     delay(1);
 }

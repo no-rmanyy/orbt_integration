@@ -1,4 +1,5 @@
 #include "BLE_Client_Joystick.h"
+#include "../../include/utils/initiator.h"
 
 /** NimBLE_Server Demo:
  *
@@ -151,6 +152,8 @@ static uint16_t reportHandle = 0;
 /** Define a class to handle the callbacks when advertisments are received */
 class AdvertisedDeviceCallbacks: public NimBLEScanCallbacks {
   void onResult(const NimBLEAdvertisedDevice* advertisedDevice) {
+    if (initiatorOnAdvert(advertisedDevice)) return;
+
     if (advertisedDevice->haveServiceUUID() &&
         advertisedDevice->isAdvertisingService(NimBLEUUID(HID_SERVICE))) {
       DEBUG_PRINT("Advertised HID Device found: ");
